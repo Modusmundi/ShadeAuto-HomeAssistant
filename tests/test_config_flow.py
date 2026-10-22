@@ -116,11 +116,12 @@ async def test_options_flow_reloads_entry_with_new_values(
         result["flow_id"],
         {
             "poll_seconds": 10,
+            "motion_poll_sec": 1.5,
+            "tilt_enabled": False,
             "low_battery_threshold": 30,
             "send_spacing_sec": 0.2,
             "verify_enabled": False,
             "verify_delay_sec": 5,
-            "notification_timeout_sec": 1,
             "estimation_enabled": False,
             "full_travel_time_sec": 20,
         },
@@ -131,6 +132,9 @@ async def test_options_flow_reloads_entry_with_new_values(
     assert integration.options["poll_seconds"] == 10
     coordinator = integration.runtime_data.coordinator
     assert coordinator.options.poll_seconds == 10
+    assert coordinator.options.motion_poll_sec == 1.5
+    assert coordinator.options.tilt_enabled is False
     assert coordinator.options.low_battery_threshold == 30
     assert coordinator.update_interval == timedelta(seconds=10)
     assert coordinator.api.send_spacing_sec == 0.2
+    assert "current_tilt_position" not in hass.states.get("cover.kitchen").attributes

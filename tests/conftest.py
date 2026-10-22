@@ -35,8 +35,21 @@ GUEST = 23388  # bottom 30
 BEDROOM = 3190  # fully up (bottom 100)
 ALL_UIDS = (KITCHEN, DINING, OFFICE, GUEST, BEDROOM)
 
+# Entity ids follow the hub's PeripheralName for each shade (device name + has_entity_name).
+SLUG = {
+    KITCHEN: "kitchen",
+    DINING: "perfectsheer_38a4",
+    OFFICE: "office",
+    GUEST: "guest_room",
+    BEDROOM: "master_bedroom",
+}
+COVER = {uid: f"cover.{slug}" for uid, slug in SLUG.items()}
+BATTERY = {uid: f"sensor.{slug}_battery" for uid, slug in SLUG.items()}
+BATTERY_LOW = {uid: f"binary_sensor.{slug}_battery_low" for uid, slug in SLUG.items()}
+
 BOTTOM = "BottomRailPosition"
 MIDDLE = "MiddleRailPosition"
+MOTOR_STOP = "MotorStop"
 TARGET = {BOTTOM: "TargetBottomRailPosition", MIDDLE: "TargetMiddleRailPosition"}
 
 
@@ -53,11 +66,21 @@ class FakeHub:
     """In-memory stand-in for the hub's ``/NM/v1`` endpoints.
 
     Shade state lives in :attr:`shades` (keyed by int UID) using the hub's own
-    field names. ``/control`` records the payload in :attr:`commands` and sets
-    the ``Target*`` fields; each ``/status`` call then moves the actual position
-    toward the target by :attr:`step` units (``None`` = instantly). Set
-    :attr:`offline` to make every request raise a connection error and
-    :attr:`reject` to make ``/control`` answer with the hub's error envelope.
+    field names, and ``/control`` follows the rules observed on the real hub
+    (see docs/HUB_PROTOCOL.md):
+
+    * ``MiddleRailPosition`` without ``BottomRailPosition`` is rejected with ``Error 2``;
+    * a command without ``MiddleRailPosition`` resets the vane target to 0;
+    * vanes are only honoured at bottom 0 (the target is coerced to 0 otherwise);
+    * ``MotorStop`` stops the shade and re-targets both axes to the actual position;
+    * the reply echoes the applied fields plus ``Error 0``.
+
+    Targets change immediately; actual positions jump to the target either at
+    once (``settle_after_polls`` is ``None``) or on the N-th ``/status`` call
+    after the command, which is how the real hub reports end states only.
+    ``stuck`` keeps actuals where they are (a shade that never moves),
+    ``offline`` makes every request raise, ``reject`` makes ``/control`` answer
+    ``Error 2``.
     """
 
     def __init__(self, mocker: AiohttpClientMocker) -> None:
@@ -70,11 +93,13 @@ class FakeHub:
 
         self.commands: list[dict[str, Any]] = []
         self.requests: list[tuple[str, dict[str, Any] | None]] = []
-        self.step: int | None = None
+        self.settle_after_polls: int | None = None
+        self.stuck = False
+        self.ignore_commands = False  # answer /control with Error 0 but change nothing
         self.reject = False
         self.offline = False
         self.status_calls = 0
-        self._last_controlled: int | None = None
+        self._polls_until_settle: dict[int, int] = {}
         self._mocker = mocker
         self.add_host(HOST)
 
@@ -98,23 +123,41 @@ class FakeHub:
         return int(self.shades[uid][TARGET[field]])
 
     def external_move(self, uid: int, *, bottom: int | None = None, middle: int | None = None) -> None:
-        """Simulate the vendor app or a remote moving a shade (target and actual change together)."""
+        """Simulate a finished move by the vendor app or a remote (target and actual change together)."""
         for field, value in ((BOTTOM, bottom), (MIDDLE, middle)):
             if value is not None:
                 self.shades[uid][TARGET[field]] = value
                 self.shades[uid][field] = value
 
-    def advance(self) -> None:
-        """Move every actual position one ``step`` toward its target."""
-        if self.step is None:
+    def external_command(self, uid: int, *, bottom: int, middle: int = 0) -> None:
+        """Simulate the vendor app issuing a command: targets change now, actuals settle later."""
+        self.shades[uid][TARGET[BOTTOM]] = bottom
+        self.shades[uid][TARGET[MIDDLE]] = middle
+        self._schedule_settle(uid)
+
+    def _schedule_settle(self, uid: int) -> None:
+        if self.stuck:
             return
-        for shade in self.shades.values():
-            for field, target_field in TARGET.items():
-                actual, target = int(shade[field]), int(shade[target_field])
-                if actual == target:
-                    continue
-                delta = min(self.step, abs(target - actual))
-                shade[field] = actual + delta if target > actual else actual - delta
+        if self.settle_after_polls is None:
+            self._settle(uid)
+        else:
+            self._polls_until_settle[uid] = self.settle_after_polls
+
+    def _settle(self, uid: int) -> None:
+        """Finish the move: actuals jump to targets, and vanes only count at bottom 0."""
+        shade = self.shades[uid]
+        shade[BOTTOM] = int(shade[TARGET[BOTTOM]])
+        if shade[BOTTOM] != 0:
+            shade[TARGET[MIDDLE]] = 0
+        shade[MIDDLE] = int(shade[TARGET[MIDDLE]])
+
+    def advance(self) -> None:
+        """Called on every /status: settle shades whose countdown has run out."""
+        for uid in list(self._polls_until_settle):
+            self._polls_until_settle[uid] -= 1
+            if self._polls_until_settle[uid] <= 0:
+                del self._polls_until_settle[uid]
+                self._settle(uid)
 
     # ----- endpoint handlers (signature required by AiohttpClientMocker) -----
 
@@ -159,33 +202,36 @@ class FakeHub:
         self._accept("control", data)
         assert data is not None
         self.commands.append(data)
+        uid = int(data["PeripheralUID"])
         now = _now()
         envelope = {"TaskID": data.get("TaskID"), "RequestTimestamp": now, "Timestamp": now * 1000}
-        if self.reject:
-            return self._ok(
-                url, {"status": {"code": 1, "error": "Invalid JSON format or content."}, "results": envelope}
-            )
-        shade = self.shades[int(data["PeripheralUID"])]
-        for field, target_field in TARGET.items():
-            if field in data:
-                shade[target_field] = int(data[field])
-                if self.step is None:
-                    shade[field] = int(data[field])
-        self._last_controlled = int(data["PeripheralUID"])
-        return self._ok(url, {"status": {"code": 0, "error": ""}, "results": envelope})
+        if self.reject or (MIDDLE in data and BOTTOM not in data):
+            return self._ok(url, {"PeripheralUID": uid, "Error": 2, **envelope})
+
+        shade = self.shades[uid]
+        applied: dict[str, Any] = {}
+        if self.ignore_commands:
+            applied = {k: v for k, v in data.items() if k in (BOTTOM, MIDDLE, MOTOR_STOP)}
+        elif MOTOR_STOP in data:
+            # The shade stays where it is and the hub re-targets both axes to that position.
+            self._polls_until_settle.pop(uid, None)
+            for field, target_field in TARGET.items():
+                shade[target_field] = shade[field]
+            applied[MOTOR_STOP] = data[MOTOR_STOP]
+        elif BOTTOM in data:
+            shade[TARGET[BOTTOM]] = int(data[BOTTOM])
+            shade[TARGET[MIDDLE]] = int(data.get(MIDDLE, 0))  # no MiddleRailPosition -> vanes close
+            applied[BOTTOM] = shade[TARGET[BOTTOM]]
+            applied[MIDDLE] = shade[TARGET[MIDDLE]]
+            self._schedule_settle(uid)
+        else:
+            applied = {k: v for k, v in data.items() if k not in ("PeripheralUID", "TaskID", "Timestamp", "ThingName")}
+        return self._ok(url, {"PeripheralUID": uid, **applied, "Error": 0, **envelope})
 
     async def _notification(self, method: str, url: Any, data: dict[str, Any] | None) -> AiohttpClientMockResponse:
-        """Answer the legacy long-poll immediately.
-
-        The real hub holds the connection open; answering at once with an event
-        that names the last controlled shade lets the long-poll watcher re-read
-        ``/status`` instead of spinning.
-        """
+        """The real hub holds the long-poll open and never delivers an event; answer empty at once."""
         self._accept("notification", data)
-        if self._last_controlled is None:
-            return self._ok(url, None, text="")
-        event = {"Status": _now(), "PeripheralList": [self._last_controlled]}
-        return self._ok(url, None, text=json.dumps(event))
+        return self._ok(url, None, text="")
 
 
 @pytest.fixture(autouse=True)

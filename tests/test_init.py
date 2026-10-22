@@ -9,34 +9,35 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.shadeauto.const import DOMAIN
 
-from .conftest import ALL_UIDS, DINING, HOST, KITCHEN, OFFICE, FakeHub
+from .conftest import ALL_UIDS, BATTERY, BATTERY_LOW, COVER, DINING, HOST, KITCHEN, OFFICE, FakeHub
 
 
 async def test_setup_creates_entities_from_hub_status(
     hass: HomeAssistant, hub: FakeHub, integration: MockConfigEntry
 ) -> None:
-    """Every shade gets a cover, a battery sensor and a low-battery binary sensor."""
+    """Every shade gets a cover, a battery sensor and a low-battery binary sensor, named by the hub."""
     assert integration.state is ConfigEntryState.LOADED
     assert [path for path, _ in hub.requests[:3]] == ["registration", "GetAllPeripheral", "status"]
 
     for uid in ALL_UIDS:
-        assert hass.states.get(f"cover.shade_{uid}") is not None, uid
-        assert hass.states.get(f"sensor.shade_{uid}_battery").state == "100"
-        assert hass.states.get(f"binary_sensor.shade_{uid}_battery_low").state == "off"
+        assert hass.states.get(COVER[uid]) is not None, uid
+        assert hass.states.get(BATTERY[uid]).state == "100"
+        assert hass.states.get(BATTERY_LOW[uid]).state == "off"
 
-    kitchen = hass.states.get(f"cover.shade_{KITCHEN}")
+    kitchen = hass.states.get(COVER[KITCHEN])
     assert kitchen.state == "closed"
     assert kitchen.attributes["current_position"] == 0
 
-    dining = hass.states.get(f"cover.shade_{DINING}")
+    dining = hass.states.get(COVER[DINING])
     assert dining.state == "open"
     assert dining.attributes["current_position"] == 100
+    assert dining.attributes["friendly_name"] == "PerfectSheer_38A4"
 
-    assert hass.states.get(f"cover.shade_{OFFICE}").attributes["current_position"] == 35
+    assert hass.states.get(COVER[OFFICE]).attributes["current_position"] == 35
 
 
-async def test_hub_device_is_registered(hass: HomeAssistant, integration: MockConfigEntry) -> None:
-    """The hub device exists so shades can reference it via ``via_device``."""
+async def test_hub_and_shade_devices_are_registered(hass: HomeAssistant, integration: MockConfigEntry) -> None:
+    """The hub device exists and each shade hangs off it with model and firmware filled in."""
     registry = dr.async_get(hass)
     hub_device = registry.async_get_device_by_identifier((DOMAIN, f"hub_{HOST}"), integration.entry_id)
     assert hub_device is not None
@@ -45,6 +46,9 @@ async def test_hub_device_is_registered(hass: HomeAssistant, integration: MockCo
     shade = registry.async_get_device_by_identifier((DOMAIN, f"shade_{HOST}_{KITCHEN}"), integration.entry_id)
     assert shade is not None
     assert shade.via_device_id == hub_device.id
+    assert shade.name == "Kitchen"
+    assert shade.model == "PerfectSheer"
+    assert shade.sw_version == "2.4.1"
 
 
 async def test_unload_entry(hass: HomeAssistant, integration: MockConfigEntry) -> None:
@@ -53,7 +57,7 @@ async def test_unload_entry(hass: HomeAssistant, integration: MockConfigEntry) -
     await hass.async_block_till_done()
 
     assert integration.state is ConfigEntryState.NOT_LOADED
-    assert hass.states.get(f"cover.shade_{KITCHEN}").state == "unavailable"
+    assert hass.states.get(COVER[KITCHEN]).state == "unavailable"
 
 
 async def test_setup_retries_when_hub_is_offline(
@@ -65,7 +69,7 @@ async def test_setup_retries_when_hub_is_offline(
     await hass.async_block_till_done()
 
     assert config_entry.state is ConfigEntryState.SETUP_RETRY
-    assert hass.states.get(f"cover.shade_{KITCHEN}") is None
+    assert hass.states.get(COVER[KITCHEN]) is None
 
 
 async def test_runtime_data_holds_api_and_coordinator(hass: HomeAssistant, integration: MockConfigEntry) -> None:
