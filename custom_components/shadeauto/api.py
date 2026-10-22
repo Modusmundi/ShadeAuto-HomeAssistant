@@ -2,8 +2,10 @@
 
 Every call is a JSON ``POST`` to ``http://<host>:10123/NM/v1/<endpoint>`` with
 no authentication. The hub identifies itself with a ``ThingName`` in the
-registration response, which later calls echo back. Positions are 0-100 with
-0 = fully lowered/closed and 100 = fully raised/open.
+registration response, which later calls echo back. Positions are 0-100:
+``BottomRailPosition`` 0 = fully lowered, 100 = fully raised;
+``MiddleRailPosition`` is the vane tilt on sheer shades, 0 = closed,
+100 = open. See ``docs/HUB_PROTOCOL.md`` for the observed behaviour.
 """
 
 from __future__ import annotations
@@ -19,10 +21,13 @@ from aiohttp import ClientSession, ClientTimeout
 
 from .const import (
     ATTR_BOTTOM_RAIL,
+    ATTR_ERROR,
     ATTR_MIDDLE_RAIL,
+    ATTR_MOTOR_STOP,
     ATTR_PERIPHERAL_UID,
     DEFAULT_PORT,
     DEFAULT_SEND_SPACING,
+    MOTOR_STOP,
     REQUEST_TIMEOUT_SEC,
 )
 
@@ -37,8 +42,22 @@ class ShadeAutoConnectionError(ShadeAutoError):
     """The hub could not be reached, timed out, or answered with an HTTP error."""
 
 
+class ShadeAutoCommandError(ShadeAutoError):
+    """The hub answered a ``/control`` request with a non-zero ``Error`` code."""
+
+    def __init__(self, code: int, payload: dict[str, Any]) -> None:
+        super().__init__(f"hub rejected command with Error {code}: {payload}")
+        self.code = code
+        self.payload = payload
+
+
 def _now_ts() -> int:
     return int(time.time())
+
+
+def clamp_position(value: int) -> int:
+    """Clamp to the 0-100 range. The hub stores out-of-range targets verbatim, so callers must not rely on it."""
+    return max(0, min(100, int(value)))
 
 
 def find_dicts_with_key(obj: Any, key: str) -> Iterator[dict[str, Any]]:
@@ -120,33 +139,32 @@ class ShadeAutoApi:
             _LOGGER.debug("status positions (uid:bottom/middle): %s", summary)
         return items
 
-    async def notification(self, *, timestamp: int, hold_sec: float) -> str:
-        """Long-poll for events since ``timestamp``.
-
-        Returns the raw body, which may hold several JSON objects back to back,
-        or ``""`` when the hub held the connection for ``hold_sec`` without an
-        event. ``hold_sec`` is both the hold requested from the hub and the
-        bound on the client-side read.
-        """
-        hold_sec = float(hold_sec)
-        payload = {"ThingName": self.thing_name, "Timestamp": int(timestamp), "Timeout": hold_sec}
-        timeout_cfg = ClientTimeout(total=None, sock_connect=REQUEST_TIMEOUT_SEC, sock_read=hold_sec)
-        try:
-            async with self._session.post(f"{self._base}/notification", json=payload, timeout=timeout_cfg) as resp:
-                resp.raise_for_status()
-                return await resp.text()
-        except TimeoutError:
-            return ""
-        except aiohttp.ClientError as err:
-            raise ShadeAutoConnectionError(f"notification: {err}") from err
+    # --- commands -------------------------------------------------------------
 
     @staticmethod
     def _task_id() -> int:
         """A per-command id; milliseconds masked into the hub's signed 31-bit range."""
         return int(time.time() * 1000) & 0x7FFFFFFF
 
-    async def control(self, uid: int | str, *, bottom: int | None = None) -> Any:
-        """Move a shade's bottom rail to ``bottom`` (0-100) and return the hub's reply."""
+    async def control(self, uid: int | str, *, bottom: int, middle: int | None = None) -> dict[str, Any]:
+        """Move a shade and return the hub's reply.
+
+        ``bottom`` is always sent: the hub rejects a command that carries only
+        ``MiddleRailPosition`` (``Error 2``), and a command without
+        ``MiddleRailPosition`` makes the hub reset the vane target to 0. Pass
+        ``middle`` explicitly whenever the vanes should stay where they are.
+        Vanes are only honoured by the hub while the shade is fully lowered.
+        """
+        fields: dict[str, Any] = {ATTR_BOTTOM_RAIL: clamp_position(bottom)}
+        if middle is not None:
+            fields[ATTR_MIDDLE_RAIL] = clamp_position(middle)
+        return await self._send_control(uid, fields)
+
+    async def stop(self, uid: int | str) -> dict[str, Any]:
+        """Stop a moving shade. The hub then re-targets the shade to wherever it stopped."""
+        return await self._send_control(uid, {ATTR_MOTOR_STOP: MOTOR_STOP})
+
+    async def _send_control(self, uid: int | str, fields: dict[str, Any]) -> dict[str, Any]:
         now = _now_ts()
         self._last_ts = now if now > self._last_ts else self._last_ts + 1
         payload: dict[str, Any] = {
@@ -156,14 +174,20 @@ class ShadeAutoApi:
         }
         if self.thing_name:
             payload["ThingName"] = self.thing_name
-        if bottom is not None:
-            payload[ATTR_BOTTOM_RAIL] = int(bottom)
+        payload.update(fields)
 
         async with self._cmd_lock:
             gap = self.send_spacing_sec - (time.time() - self._last_send)
             if gap > 0:
                 await asyncio.sleep(gap)
             try:
-                return await self._post("control", payload)
+                reply = await self._post("control", payload)
             finally:
                 self._last_send = time.time()
+
+        if not isinstance(reply, dict):
+            return {}
+        code = reply.get(ATTR_ERROR)
+        if isinstance(code, int) and code != 0:
+            raise ShadeAutoCommandError(code, payload)
+        return reply

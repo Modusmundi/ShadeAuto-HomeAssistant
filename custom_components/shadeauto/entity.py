@@ -8,7 +8,20 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN, MANUFACTURER
-from .coordinator import ShadeAutoCoordinator
+from .coordinator import Peripheral, ShadeAutoCoordinator
+
+# Module type/detail pairs the hub reports for shade families we recognise.
+KNOWN_MODELS = {(48, 3): "PerfectSheer"}
+
+
+def model_name(peripheral: Peripheral) -> str:
+    """A readable model string for the device page."""
+    key = (peripheral.module_type, peripheral.module_detail)
+    if key in KNOWN_MODELS:
+        return KNOWN_MODELS[key]
+    if peripheral.module_type is None:
+        return "Shade"
+    return f"Shade (type {peripheral.module_type}/{peripheral.module_detail})"
 
 
 class ShadeAutoEntity(CoordinatorEntity[ShadeAutoCoordinator]):
@@ -31,8 +44,11 @@ class ShadeAutoEntity(CoordinatorEntity[ShadeAutoCoordinator]):
             identifiers={(DOMAIN, f"shade_{host}_{self._uid}")},
             name=peripheral.name,
             manufacturer=MANUFACTURER,
-            model=str(peripheral.module_detail) if peripheral.module_detail is not None else "Shade",
+            model=model_name(peripheral),
         )
+        firmware = coordinator.status_for(self._uid).get("FirmwareVersion")
+        if firmware:
+            self._attr_device_info["sw_version"] = str(firmware)
         if coordinator.hub_device_id is not None:
             self._attr_device_info["via_device_id"] = coordinator.hub_device_id
 
