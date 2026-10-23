@@ -85,6 +85,8 @@ class ShadeAutoConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             host = user_input[CONF_HOST].strip()
             new_unique_id = _unique_id(host)
+            # Not _abort_if_unique_id_configured(): it would also trip on this
+            # entry's own unique id when the host is submitted unchanged.
             if any(
                 other.unique_id == new_unique_id and other.entry_id != entry.entry_id
                 for other in self._async_current_entries(include_ignore=False)
@@ -120,7 +122,9 @@ class ShadeAutoOptionsFlow(OptionsFlowWithReload):
                 ),
                 Optional(CONF_SEND_SPACING_SEC, default=current.send_spacing_sec): _seconds(0.15, 1.0, 0.05),
                 Optional(CONF_VERIFY_ENABLED, default=current.verify_enabled): BooleanSelector(),
-                Optional(CONF_VERIFY_DELAY_SEC, default=current.verify_delay_sec): _seconds(1, 60),
+                # The hub reports end states 10-35 s after a command; verifying
+                # sooner would re-send a command the shade is still carrying out.
+                Optional(CONF_VERIFY_DELAY_SEC, default=current.verify_delay_sec): _seconds(30, 120),
                 Optional(CONF_ESTIMATION_ENABLED, default=current.estimation_enabled): BooleanSelector(),
                 Optional(CONF_FULL_TRAVEL_TIME_SEC, default=current.full_travel_time_sec): _seconds(5, 120),
             }

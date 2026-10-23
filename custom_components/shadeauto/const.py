@@ -36,7 +36,11 @@ DEFAULT_SEND_SPACING = 0.75
 DEFAULT_VERIFY_ENABLED = True
 DEFAULT_VERIFY_DELAY = 60.0  # seconds after a command before checking the shade reached its target
 DEFAULT_ESTIMATION_ENABLED = True
-DEFAULT_FULL_TRAVEL_TIME = 28.0  # seconds a shade needs for a full 0 -> 100 travel; drives the slider animation
+# Seconds assumed for a full 0 -> 100 travel; drives the slider animation only.
+# Upstream's default for their shades. A PerfectSheer was observed to take
+# roughly 60 s for a full travel (28-35 s for half travels in the log), so
+# users tune it in the options.
+DEFAULT_FULL_TRAVEL_TIME = 28.0
 DEFAULT_TILT_ENABLED = True  # expose MiddleRailPosition as vane tilt (PerfectSheer); turn off for plain shades
 
 # --- Hub field names ---------------------------------------------------------
