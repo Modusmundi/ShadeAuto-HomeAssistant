@@ -4,14 +4,19 @@ The hub is the source of truth. Each shade has two axes, the bottom rail
 (lift) and the middle rail (vane tilt); for each the hub reports an actual
 position and a target. A shade is *moving* while the two differ. Our own
 commands are tracked as *pending* targets for a short grace period, until the
-hub's reported target reflects them.
+hub's reported target reflects them; whether the hub ever did reflect a
+command is remembered per axis, because that is what later tells a lost
+command apart from a shade someone else re-commanded.
 
-Data flow: a cover entity sends a command through :class:`ShadeAutoApi` and
-calls :meth:`ShadeAutoCoordinator.register_command`. While anything is moving
-the coordinator polls ``/status`` every ``motion_poll_sec`` instead of
-``poll_seconds`` (the hub publishes only end states, and it does not push
-notifications), and after ``verify_delay_sec`` it checks once that the shade
-reached its target, retrying the command a single time if it did not and if
+Data flow: a cover entity calls :meth:`ShadeAutoCoordinator.register_command`,
+sends the command through :class:`ShadeAutoApi` and refreshes the coordinator
+(or calls :meth:`ShadeAutoCoordinator.discard_command` if the post failed).
+While any axis is *unsettled* (our command pending, or the hub's target away
+from its actual) the coordinator polls ``/status`` every ``motion_poll_sec``
+instead of ``poll_seconds``: the hub publishes only end states, does not push
+notifications, and after a stop reports where the shade ended only some 35 s
+later. After ``verify_delay_sec`` it checks once that the shade reached its
+target on both axes, retrying the command a single time if it did not and if
 nobody else has re-commanded the shade in the meantime.
 """
 
@@ -23,9 +28,8 @@ import logging
 import time
 from typing import Any
 
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import CALLBACK_TYPE, HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -51,14 +55,15 @@ from .util import to_int
 
 _LOGGER = logging.getLogger(__name__)
 
-# Fields copied from each /status record into the coordinator's data.
+# Fields copied from each /status record into the coordinator's data. The
+# module and firmware fields play no part in motion tracking; they are kept
+# for the device page and for future auto-detection of shade types.
 STATUS_FIELDS = (
     ATTR_BOTTOM_RAIL,
     ATTR_MIDDLE_RAIL,
     ATTR_TARGET_BOTTOM_RAIL,
     ATTR_TARGET_MIDDLE_RAIL,
     ATTR_BATTERY,
-    "Name",
     "ModuleType",
     "ModuleDetail",
     "FirmwareVersion",
@@ -77,7 +82,8 @@ class Peripheral:
     @classmethod
     def from_hub(cls, record: dict[str, Any]) -> Peripheral:
         uid = str(record.get(ATTR_PERIPHERAL_UID))
-        name = record.get("PeripheralName") or record.get("Name") or record.get("DisplayName")
+        # PeripheralName is what the hub sends; Name is a fallback for hub firmware that might use it instead.
+        name = record.get("PeripheralName") or record.get("Name")
         return cls(
             uid=uid,
             name=str(name) if name else f"Shade {uid}",
@@ -95,6 +101,7 @@ class AxisState:
     pending: int | None = None  # target we sent that the hub has not reflected yet
     pending_ts: float | None = None  # monotonic time the pending target was sent
     changed_ts: float | None = None  # monotonic time actual/target last changed (or we sent a command)
+    reflected: bool = False  # the hub's target matched our last command at least once
 
     def at(self, value: int) -> bool:
         return self.actual is not None and abs(self.actual - value) <= POSITION_TOLERANCE
@@ -126,7 +133,8 @@ class ShadeAutoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.api = api
         self.options = options
-        self.hub_device_id: str | None = None  # set by __init__ once the hub device exists
+        # Assigned by async_setup_entry in the package __init__.py once the hub device exists.
+        self.hub_device_id: str | None = None
         self.peripherals: dict[str, Peripheral] = {}
         self._shades: dict[str, ShadeState] = {}
         self._cmd_seq = 0
@@ -160,22 +168,43 @@ class ShadeAutoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         state = self._axis(uid, axis)
         return state.pending if state.pending is not None else state.target
 
-    def is_moving(self, uid: str, axis: str) -> bool:
-        """True while the hub's target differs from its actual position (or our command is pending)."""
-        shade = self._shade(uid)
-        state = shade.axes[axis]
+    def _unsettled(self, uid: str, axis: str) -> bool:
+        """True while the hub still owes an end state for ``axis``.
+
+        That is: our command is pending, or the hub's target differs from its
+        actual position and the shade has not stalled. Unlike :meth:`is_moving`
+        this ignores our own stop command, because the hub keeps the old target
+        until it reports the stop point some 35 s later, and we must keep
+        polling fast to see it.
+        """
+        state = self._axis(uid, axis)
         if state.pending is not None:
             return True
         if state.actual is None or state.target is None:
             return False
         if abs(state.target - state.actual) <= POSITION_TOLERANCE:
             return False
-        if shade.stopped_ts is not None and (state.changed_ts is None or state.changed_ts <= shade.stopped_ts):
-            # We stopped it; the hub re-targets to the stopped position only after a delay.
-            return False
         # Nothing changing for a long time means a stalled or unreachable shade, not a move.
         stalled = state.changed_ts is not None and time.monotonic() - state.changed_ts > MOTION_FAILSAFE_SEC
         return not stalled
+
+    def _any_unsettled(self) -> bool:
+        return any(self._unsettled(uid, axis) for uid in self._shades for axis in AXES)
+
+    def is_moving(self, uid: str, axis: str) -> bool:
+        """True while the hub's target differs from its actual position (or our command is pending).
+
+        Drives the entity's opening/closing flags, so a shade we just stopped
+        counts as not moving even though the hub still shows the old target.
+        """
+        shade = self._shade(uid)
+        state = shade.axes[axis]
+        if state.pending is not None:
+            return True
+        if shade.stopped_ts is not None and (state.changed_ts is None or state.changed_ts <= shade.stopped_ts):
+            # We stopped it; the hub re-targets to the stopped position only after a delay.
+            return False
+        return self._unsettled(uid, axis)
 
     def is_shade_moving(self, uid: str) -> bool:
         return any(self.is_moving(uid, axis) for axis in AXES)
@@ -185,14 +214,19 @@ class ShadeAutoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     # --- polling --------------------------------------------------------------
 
-    async def async_config_entry_first_refresh(self) -> None:
+    async def _async_setup(self) -> None:
+        """Register with the hub and fetch the shade list, once, before the first refresh.
+
+        Raising ``UpdateFailed`` here makes the base class turn the failure
+        into ``ConfigEntryNotReady``, so an unreachable hub puts the entry into
+        setup retry instead of error.
+        """
         try:
             await self.api.registration()
             records = await self.api.get_all_peripheral()
         except ShadeAutoError as err:
-            raise ConfigEntryNotReady(f"Cannot reach ShadeAuto hub at {self.api.host}: {err}") from err
+            raise UpdateFailed(f"Cannot reach ShadeAuto hub at {self.api.host}: {err}") from err
         self.peripherals = {p.uid: p for p in map(Peripheral.from_hub, records)}
-        await super().async_config_entry_first_refresh()
 
     async def async_shutdown(self) -> None:
         for shade in self._shades.values():
@@ -234,26 +268,28 @@ class ShadeAutoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
         if target == state.pending:
             state.pending = None  # the hub accepted our command
+            state.reflected = True
         elif state.pending_ts is not None and now - state.pending_ts > PENDING_GRACE_SEC:
             _LOGGER.debug("UID %s %s: hub never reflected target %s; dropping pending", uid, axis, state.pending)
             state.pending = None
 
     def _apply_poll_interval(self) -> None:
-        """Poll fast while any shade moves, slowly otherwise."""
-        wanted = self._motion_interval if self.any_moving() else self._idle_interval
+        """Poll fast while any axis is unsettled, slowly otherwise."""
+        wanted = self._motion_interval if self._any_unsettled() else self._idle_interval
         if self.update_interval != wanted:
             _LOGGER.debug("Poll interval -> %ss", wanted.total_seconds())
             self.update_interval = wanted
 
     # --- commands -------------------------------------------------------------
 
-    def register_command(self, uid: str, *, bottom: int, middle: int | None) -> int:
+    def register_command(self, uid: str, *, bottom: int, middle: int) -> int:
         """Record a move we are about to send; returns its command id.
 
         Call it before the ``/control`` post so the pending target covers the
         send, and refresh the coordinator after the post so the next poll sees
-        the hub's new target. ``middle`` is ``None`` when the command carries no
-        ``MiddleRailPosition``, which the hub treats as 0.
+        the hub's new target. If the post fails, hand the returned id to
+        :meth:`discard_command`. Both axes are given: a command always sets
+        both targets on the hub (the entity resolves the vane value first).
         """
         uid = str(uid)
         shade = self._shade(uid)
@@ -261,18 +297,46 @@ class ShadeAutoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         cmd_id = shade.cmd_id = self._cmd_seq
         shade.retry_attempted = False
         shade.stopped_ts = None
-        self._set_pending(shade, bottom=int(bottom), middle=middle)
+        bottom, middle = int(bottom), int(middle)
+        self._set_pending(shade, bottom=bottom, middle=middle)
         self._apply_poll_interval()
 
         self._cancel_verify(shade)
         if self.options.verify_enabled and self.options.verify_delay_sec > 0:
 
-            async def _verify(_now: datetime) -> None:
+            @callback
+            def _start_verify(_now: datetime) -> None:
                 shade.cancel_verify = None
-                await self.async_verify_and_retry(uid, bottom=int(bottom), middle=middle, cmd_id=cmd_id)
+                if self.config_entry.state is not ConfigEntryState.LOADED:
+                    return
+                # As an entry background task the verify dies with the entry
+                # instead of posting to the hub from a half-unloaded integration.
+                self.config_entry.async_create_background_task(
+                    self.hass,
+                    self.async_verify_and_retry(uid, bottom=bottom, middle=middle, cmd_id=cmd_id),
+                    name=f"{DOMAIN} verify {uid}",
+                )
 
-            shade.cancel_verify = async_call_later(self.hass, self.options.verify_delay_sec, _verify)
+            shade.cancel_verify = async_call_later(self.hass, self.options.verify_delay_sec, _start_verify)
         return cmd_id
+
+    def discard_command(self, uid: str, cmd_id: int) -> None:
+        """Forget a registered command that never reached the hub.
+
+        Acts only while ``cmd_id`` is still the shade's newest command: clears
+        the pending targets on both axes, cancels the verify timer, bumps the
+        command id so nothing stale can fire, and re-applies the poll
+        interval. A no-op for any older id.
+        """
+        shade = self._shade(uid)
+        if shade.cmd_id != cmd_id:
+            return
+        self._cmd_seq += 1
+        shade.cmd_id = self._cmd_seq
+        for state in shade.axes.values():
+            state.pending = None
+        self._cancel_verify(shade)
+        self._apply_poll_interval()
 
     def register_stop(self, uid: str) -> None:
         """Record that we told ``uid`` to stop; cancels any pending verify."""
@@ -286,14 +350,14 @@ class ShadeAutoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._apply_poll_interval()
 
     @staticmethod
-    def _set_pending(shade: ShadeState, *, bottom: int, middle: int | None) -> None:
+    def _set_pending(shade: ShadeState, *, bottom: int, middle: int) -> None:
         now = time.monotonic()
-        targets = {AXIS_BOTTOM: int(bottom), AXIS_MIDDLE: 0 if middle is None else int(middle)}
-        for axis, value in targets.items():
+        for axis, value in ((AXIS_BOTTOM, bottom), (AXIS_MIDDLE, middle)):
             state = shade.axes[axis]
             state.pending = value
             state.pending_ts = now
             state.changed_ts = now
+            state.reflected = False
 
     @staticmethod
     def _cancel_verify(shade: ShadeState) -> None:
@@ -301,13 +365,15 @@ class ShadeAutoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             shade.cancel_verify()
             shade.cancel_verify = None
 
-    async def async_verify_and_retry(self, uid: str, *, bottom: int, middle: int | None, cmd_id: int) -> None:
+    async def async_verify_and_retry(self, uid: str, *, bottom: int, middle: int, cmd_id: int) -> None:
         """Resend the command once if the shade is not where we asked.
 
         Runs ``verify_delay_sec`` after a command. Does nothing if a newer
-        command was issued for the shade, or if the hub's own target has
-        changed since (the app or a remote re-commanded it, and fighting them
-        would be wrong).
+        command was issued for the shade, or if the hub's target on either
+        axis has moved away from ours after once reflecting it (the app or a
+        remote re-commanded the shade, and fighting them would be wrong). A
+        target the hub never reflected means the command was lost, which is
+        exactly what the retry is for.
         """
         uid = str(uid)
         shade = self._shade(uid)
@@ -317,20 +383,22 @@ class ShadeAutoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if shade.cmd_id != cmd_id:
             return
 
-        wanted = {AXIS_BOTTOM: int(bottom), AXIS_MIDDLE: 0 if middle is None else int(middle)}
-        if all(shade.axes[axis].at(value) for axis, value in wanted.items()):
+        wanted = {AXIS_BOTTOM: int(bottom), AXIS_MIDDLE: int(middle)}
+        # An axis the hub does not report (actual None) cannot fail to arrive.
+        if all(shade.axes[axis].actual is None or shade.axes[axis].at(value) for axis, value in wanted.items()):
             return
-        bottom_axis = shade.axes[AXIS_BOTTOM]
-        if bottom_axis.target is not None and bottom_axis.target != wanted[AXIS_BOTTOM]:
-            _LOGGER.debug("UID %s: hub target changed to %s by someone else; not retrying", uid, bottom_axis.target)
-            return
+        for axis, value in wanted.items():
+            state = shade.axes[axis]
+            if state.reflected and state.target is not None and state.target != value:
+                _LOGGER.debug("UID %s %s: target changed to %s by someone else; not retrying", uid, axis, state.target)
+                return
 
         _LOGGER.debug(
             "UID %s not at bottom=%s middle=%s (hub reports %s/%s); retrying once",
             uid,
             bottom,
             middle,
-            bottom_axis.actual,
+            shade.axes[AXIS_BOTTOM].actual,
             shade.axes[AXIS_MIDDLE].actual,
         )
         shade.retry_attempted = True
@@ -339,6 +407,8 @@ class ShadeAutoCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except ShadeAutoError as err:
             _LOGGER.warning("Retry for UID %s failed: %s", uid, err)
             return
+        if shade.cmd_id != cmd_id:
+            return  # a newer command arrived while the retry was in flight; its bookkeeping wins
         self._set_pending(shade, bottom=bottom, middle=middle)
         self._apply_poll_interval()
         await self.async_refresh()

@@ -72,15 +72,24 @@ class FakeHub:
     * ``MiddleRailPosition`` without ``BottomRailPosition`` is rejected with ``Error 2``;
     * a command without ``MiddleRailPosition`` resets the vane target to 0;
     * vanes are only honoured at bottom 0 (the target is coerced to 0 otherwise);
-    * ``MotorStop`` stops the shade and re-targets both axes to the actual position;
+    * ``MotorStop`` stops the motor; the hub then reports nothing for ~35 s and
+      finally sets ``BottomRailPosition`` and ``TargetBottomRailPosition`` to
+      the stop point in one update, with the vanes and their target at 0 when
+      the stop point is above 0 (log C4b);
     * the reply echoes the applied fields plus ``Error 0``.
 
     Targets change immediately; actual positions jump to the target either at
     once (``settle_after_polls`` is ``None``) or on the N-th ``/status`` call
     after the command, which is how the real hub reports end states only.
-    ``stuck`` keeps actuals where they are (a shade that never moves),
-    ``offline`` makes every request raise, ``reject`` makes ``/control`` answer
-    ``Error 2``.
+    ``landing_offset`` makes a shade land that far from its target (a real
+    shade may well report 99 for a target of 100). A stop lands at
+    ``stop_point`` (default: wherever the actual position is, i.e. the shade
+    had not moved) and is reported at once or, with ``stop_reports_after_polls``,
+    on the N-th ``/status`` call after the stop. ``stuck`` keeps actuals where
+    they are (a shade that never moves), ``ignore_commands`` answers ``/control``
+    with ``Error 0`` but changes nothing, ``offline`` makes every request raise,
+    ``reject`` makes ``/control`` answer ``Error 2``, and ``omit_fields`` leaves
+    fields out of every ``/status`` record (a shade the hub reports less about).
     """
 
     def __init__(self, mocker: AiohttpClientMocker) -> None:
@@ -94,12 +103,17 @@ class FakeHub:
         self.commands: list[dict[str, Any]] = []
         self.requests: list[tuple[str, dict[str, Any] | None]] = []
         self.settle_after_polls: int | None = None
+        self.landing_offset = 0
+        self.stop_point: int | None = None
+        self.stop_reports_after_polls: int | None = None
         self.stuck = False
         self.ignore_commands = False  # answer /control with Error 0 but change nothing
         self.reject = False
         self.offline = False
+        self.omit_fields: tuple[str, ...] = ()
         self.status_calls = 0
         self._polls_until_settle: dict[int, int] = {}
+        self._polls_until_stop: dict[int, tuple[int, int]] = {}  # uid -> (polls left, stop point)
         self._mocker = mocker
         self.add_host(HOST)
 
@@ -144,20 +158,37 @@ class FakeHub:
             self._polls_until_settle[uid] = self.settle_after_polls
 
     def _settle(self, uid: int) -> None:
-        """Finish the move: actuals jump to targets, and vanes only count at bottom 0."""
+        """Finish the move: actuals land at the targets (plus ``landing_offset``), and vanes only count at bottom 0."""
         shade = self.shades[uid]
-        shade[BOTTOM] = int(shade[TARGET[BOTTOM]])
-        if shade[BOTTOM] != 0:
+        if shade[TARGET[BOTTOM]] != 0:
             shade[TARGET[MIDDLE]] = 0
-        shade[MIDDLE] = int(shade[TARGET[MIDDLE]])
+        for field in (BOTTOM, MIDDLE):
+            shade[field] = max(0, min(100, int(shade[TARGET[field]]) + self.landing_offset))
+
+    def _report_stop(self, uid: int, point: int) -> None:
+        """Report where the motor stopped, the way the hub did ~35 s after MotorStop (log C4b)."""
+        shade = self.shades[uid]
+        shade[BOTTOM] = shade[TARGET[BOTTOM]] = point
+        if point != 0:
+            shade[MIDDLE] = shade[TARGET[MIDDLE]] = 0
+        else:
+            # What a stop at bottom 0 does to the vane target is unverified; keep the actual.
+            shade[TARGET[MIDDLE]] = shade[MIDDLE]
 
     def advance(self) -> None:
-        """Called on every /status: settle shades whose countdown has run out."""
+        """Called on every /status: settle shades, and report stops, whose countdown has run out."""
         for uid in list(self._polls_until_settle):
             self._polls_until_settle[uid] -= 1
             if self._polls_until_settle[uid] <= 0:
                 del self._polls_until_settle[uid]
                 self._settle(uid)
+        for uid in list(self._polls_until_stop):
+            polls, point = self._polls_until_stop[uid]
+            if polls - 1 <= 0:
+                del self._polls_until_stop[uid]
+                self._report_stop(uid, point)
+            else:
+                self._polls_until_stop[uid] = (polls - 1, point)
 
     # ----- endpoint handlers (signature required by AiohttpClientMocker) -----
 
@@ -192,7 +223,7 @@ class FakeHub:
         now = _now()
         body = {
             **self.status_top,
-            "Peripherals": [dict(s) for s in self.shades.values()],
+            "Peripherals": [{k: v for k, v in s.items() if k not in self.omit_fields} for s in self.shades.values()],
             "RequestTimestamp": now,
             "Timestamp": now * 1000,
         }
@@ -213,12 +244,16 @@ class FakeHub:
         if self.ignore_commands:
             applied = {k: v for k, v in data.items() if k in (BOTTOM, MIDDLE, MOTOR_STOP)}
         elif MOTOR_STOP in data:
-            # The shade stays where it is and the hub re-targets both axes to that position.
+            # The motor stops; the hub reports the stop point now or after N polls (see the class docstring).
             self._polls_until_settle.pop(uid, None)
-            for field, target_field in TARGET.items():
-                shade[target_field] = shade[field]
+            point = self.position(uid) if self.stop_point is None else self.stop_point
+            if self.stop_reports_after_polls is None:
+                self._report_stop(uid, point)
+            else:
+                self._polls_until_stop[uid] = (self.stop_reports_after_polls, point)
             applied[MOTOR_STOP] = data[MOTOR_STOP]
         elif BOTTOM in data:
+            self._polls_until_stop.pop(uid, None)  # a new move supersedes an unreported stop
             shade[TARGET[BOTTOM]] = int(data[BOTTOM])
             shade[TARGET[MIDDLE]] = int(data.get(MIDDLE, 0))  # no MiddleRailPosition -> vanes close
             applied[BOTTOM] = shade[TARGET[BOTTOM]]
