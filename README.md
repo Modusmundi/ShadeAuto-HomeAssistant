@@ -23,7 +23,7 @@ Sheer (PerfectSheer) shades can only tilt their vanes while the shade is **fully
 
 - `cover.open_cover_tilt`, `cover.close_cover_tilt` and `cover.set_cover_tilt_position` **lower the shade if it is not already down**, then set the vanes.
 - Raising the shade to any height closes the vanes; lowering it fully (`close_cover` or position 0) keeps whatever vane setting it had.
-- `stop_cover` and `stop_cover_tilt` both stop the motor; the hub then reports wherever the shade ended up.
+- `stop_cover` and `stop_cover_tilt` both stop the motor. Home Assistant stops showing the shade as opening or closing right away; the position it actually stopped at appears a couple of seconds after the hub reports it (about 35 s after the stop on the hubs seen so far). A shade stopped above the bottom ends with its vanes closed.
 
 If your shades have no vanes, turn **Expose vane tilt** off in the integration's options and the tilt controls disappear.
 
@@ -39,12 +39,12 @@ Settings → Devices & Services → ShadeAuto → **Configure**. Changes apply i
 - **Expose vane tilt**: show tilt controls and `current_tilt_position` (default on).
 - **Low battery threshold**: battery % at which the `*_battery_low` flag turns on (default 20 %).
 - **Minimum time between shade commands**: gap between hub `/control` posts (default 0.75 s).
-- **Verify the shade arrived and retry once**: after the delay below, re-send a command once if the shade is not near the requested position. The retry is skipped if the shade was re-commanded from the app or a remote in the meantime.
-- **Seconds to wait before verifying** (default 60 s).
-- **Animate the position slider while a shade is moving**: interpolates `current_position` during a lift so the slider moves instead of jumping; the hub's position always wins once the move has settled.
-- **Time for a full open or close**: travel time used by the animation (default 28 s; PerfectSheer shades observed around 30–35 s).
+- **Verify the shade arrived and retry once**: after the delay below, check both the lift and the vane target the hub holds against what was asked for. If the hub never took the command (its target never matched ours), the command is re-sent once. If the hub had taken it and the target changed afterwards, the shade was re-commanded from the app or a remote in the meantime and nothing is re-sent.
+- **Seconds to wait before verifying** (default 60 s, minimum 30 s). The hub reports where a shade ended up 10–35 s after a command; checking earlier would re-send a command to a shade that is still moving.
+- **Animate the position slider while a shade is moving**: interpolates `current_position` during a lift so the slider moves instead of jumping; the hub's position always wins once the move has settled, and the animation gives up early if the hub's target changes mid-move (someone re-commanded the shade from the app or a remote).
+- **Time for a full open or close**: travel time used by the animation. The default of 28 s is upstream's value for their shades; PerfectSheer shades were observed to need roughly 60 s for a full travel (28–35 s for half travels), so set it to about 60 for those.
 
-To change the hub's IP address, use **Reconfigure** on the integration entry.
+To change the hub's IP address, use **Reconfigure** on the integration entry. Devices, areas and names are kept: the integration identifies the hub by its `ThingName`, not by its address.
 
 ## Installation
 
@@ -63,7 +63,7 @@ Then
 2. Restart HA, then add the integration.
 
 ### Upgrading from 0.3.x
-Entity ids and unique ids are unchanged. Shades that were still called "Shade <id>" take their name from the ShadeAuto app (renames you made in Home Assistant are kept). The *Notification timeout* option is gone; the hub never delivered notifications, so the integration polls instead.
+Entity ids and unique ids are unchanged. Shades that were still called "Shade <id>" take their name from the ShadeAuto app (renames you made in Home Assistant are kept). Devices that 0.3.x registered under the hub's IP address are moved to the hub's `ThingName` identity on the first start, so they keep their areas and names and survive a later address change. The *Notification timeout* option is gone; the hub never delivered notifications, so the integration polls instead. The verify delay now has a minimum of 30 s.
 
 ## Example use
 
@@ -114,6 +114,8 @@ actions:
   ```bash
   curl -s -X POST http://HUB_IP:10123/NM/v1/registration -H 'Content-Type: application/json' -d '{"Timestamp": 1700000000}'
   ```
+  If the hub answers but its shade list comes back as an error or as something that is not JSON, the integration does not load with zero shades; it keeps retrying setup and logs why.
+- **"Could not move shade …" when calling a service?** The hub refused the command or did not answer. The shade is shown at the position the hub last reported, nothing is retried, and the message names the shade and the reason.
 - **Watch what the hub is doing** while you use the app, a remote or Home Assistant:
   ```bash
   python3 tools/hubwatch.py --host HUB_IP --names
@@ -130,6 +132,7 @@ actions:
 - The hub reports positions only when a move has **finished** (typically 10–35 s after the command), never while moving. The slider animation bridges that gap for lifts; vane changes appear when the hub reports them.
 - Moves made with a **physical remote** are reported by the hub only sometimes; moves from the ShadeAuto app are always reported. Home Assistant can only show what the hub knows.
 - Vanes can be tilted only while the shade is fully lowered (a hub rule, see above). True top-down/bottom-up shades are not supported as a second lift position.
+- `stop_cover_tilt` is exposed, but stopping a shade in the middle of a vane-only move has not been tested separately. It is the same motor and the same stop command as `stop_cover`; what the hub reports for the vanes afterwards is unknown.
 - Battery is whatever the hub reports in `BatteryVoltage`, which is a percentage on the hubs seen so far.
 - The API is not official; behavior may change with hub firmware updates.
 

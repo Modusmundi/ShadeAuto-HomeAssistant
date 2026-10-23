@@ -182,8 +182,14 @@ Top-level fields:
 | `RequestTimestamp`, `Timestamp` | int | Echo of the request's `Timestamp` (s); hub clock (ms). |
 
 **What the integration uses it for.** `ShadeAutoApi.registration()` stores
-`ThingName` and nothing else. The coordinator uses the ThingName (falling back
-to the host) as the stable identity in entity unique IDs.
+`ThingName` and nothing else. The coordinator exposes it as
+`coordinator.identity` and uses it (falling back to the host) as the stable
+identity in entity unique IDs and in device identifiers. Devices are tied to
+the ThingName, not the host, so changing the address through Reconfigure
+keeps devices, areas and names; devices that 0.3.x created with host-based
+identifiers are migrated to the ThingName once, at setup. The call runs in
+the coordinator's `_async_setup` hook, so a failure raises
+`ConfigEntryNotReady` and setup is retried.
 
 **Errors.** None observed. Behaviour with a missing or malformed body is
 **unverified**.
@@ -274,10 +280,15 @@ Things to notice:
 - `TaskID` is echoed back inside `results`.
 
 **What the integration uses it for.** `ShadeAutoApi.get_all_peripheral()` is
-called once at setup to build the list of shades (`Peripheral.from_hub` in
-`coordinator.py`), which decides which entities exist. `Peripheral.from_hub`
-reads `PeripheralName` (falling back to `Name`, then `DisplayName`, then
-`Shade <uid>`), so the names in this reply become the device names;
+called once at setup, from the coordinator's `_async_setup` hook, to build
+the list of shades (`Peripheral.from_hub` in `coordinator.py`), which decides
+which entities exist. The error envelope (`status.code` non-zero, see
+"Errors" below) and a body that is not JSON are both treated as connection
+errors: setup raises `ConfigEntryNotReady` and Home Assistant retries it
+later. The integration never loads with zero shades because of a bad reply.
+`Peripheral.from_hub`
+reads `PeripheralName` (falling back to `Name`, then `Shade <uid>`), so the
+names in this reply become the device names;
 `hubwatch.py --names` reads the same key. The `ModuleType`/`ModuleDetail` pair
 from this reply picks the device model string (`entity.py`: `(48, 3)` is shown
 as "PerfectSheer").
@@ -293,9 +304,11 @@ calls this before `/registration`), the hub answers (`error_invalid.json`):
 ```
 
 The HTTP status code of that reply was not recorded (**unverified**; it was
-captured as a normal body, so it was probably 200). `api.py` does not inspect
-`status.code`; it just finds no `PeripheralUID` dicts and returns `[]`. Other
-`code` values are **unverified**.
+captured as a normal body, so it was probably 200). `api.py` raises
+`ShadeAutoResponseError` (a `ShadeAutoError` carrying `.code` and the
+`status.error` text) when `status.code` is non-zero, which setup turns into
+`ConfigEntryNotReady`; it never returns `[]` for this envelope. Other `code`
+values are **unverified**.
 
 ### 2.3 `/status`
 
@@ -365,12 +378,20 @@ The per-shade fields are described in section 3.
 `motion_poll_sec` (default 2 s) while any shade is moving. It copies the actual
 and target position of both rails plus `BatteryVoltage`, `ModuleType`,
 `ModuleDetail` and `FirmwareVersion` per shade (`STATUS_FIELDS` in
-`coordinator.py`; the list also names `"Name"`, which `/status` never
-contains), and a shade counts as moving while actual != target on either axis
-(`AXIS_FIELDS`, `is_moving`). The cover position and tilt, the opening/closing
-direction, the battery sensor, the low-battery binary sensor and the device
-`sw_version` all come from here. It is also re-read right after a command and
-again at the verify delay to detect that a shade has arrived.
+`coordinator.py`), and a shade counts as moving while actual != target on either axis
+(`AXIS_FIELDS`, `is_moving`). After a `MotorStop` the entity stops showing
+motion at once, but the coordinator keeps polling at the motion interval
+until the hub reports the stop point (target == actual) or the motion
+failsafe elapses, because the hub takes about 35 s to rewrite the target
+(4.6). The cover position and tilt, the opening/closing direction, the
+battery sensor, the low-battery binary sensor and the device `sw_version` all
+come from here. It is also re-read right after a command, and again at the
+verify delay, when the coordinator compares the hub's `Target*` fields on
+both axes with what it sent: a target the hub never reflected means the
+command was lost and it is re-sent once; a target the hub reflected and then
+changed means the app, a remote or the hub itself (4.4) re-commanded the
+shade, and nothing is re-sent. The cover's slider estimate is dropped as soon
+as the hub's target stops matching the target it is estimating toward.
 
 **Errors.** None observed. Top-level `Error` was 0 on every poll in the log
 (`hub Error=0` lines). Non-zero values are **unverified**.
@@ -439,12 +460,18 @@ required) and adds `MiddleRailPosition` whenever `middle` is not `None`; both
 are clamped to 0-100 first (`clamp_position()`). `ShadeAutoApi.stop(uid)`
 sends `MotorStop: 170`. `_send_control()` raises `ShadeAutoCommandError` when
 the reply's `Error` is non-zero, so an `Error: 2` rejection reaches callers as
-an exception, not as a returned dict. The cover entity (`cover.py`) passes both
+an exception, not as a returned dict. The cover entity turns that exception,
+like a connection error, into a `HomeAssistantError` naming the shade
+("Could not move shade Kitchen: ...") and drops its optimistic state at once,
+so the entity shows the hub's last known position instead of "opening". The
+cover entity (`cover.py`) passes both
 fields on every open, close, set-position and tilt call: lowering to 0 and
 close keep the current vane target, any other height sends
 `MiddleRailPosition: 0` explicitly (4.4 would reset it anyway), and tilt
 commands send `BottomRailPosition: 0`. The verify-and-retry logic resends the
-same pair.
+same pair, once, and only when the hub never reflected the targets it was
+sent; a retry overtaken by a newer command does not overwrite that command's
+pending state.
 
 ### 2.5 `/notification`
 
@@ -912,7 +939,16 @@ try except where noted.
     harmless, but unknown. Test on a shade whose position you do not care
     about, with the watcher running, and never test the Limit/Clean/Reverse
     fields on a shade you cannot afford to re-calibrate.
-12. **Keep collecting evidence.** The characterization log lives next to this
+12. **Stop during a vane-only move.** `stop_cover_tilt` sends the same
+    `MotorStop: 170` as `stop_cover` (one motor), but a stop while the vanes
+    are tilting at bottom 0 was never tried. Send `{"BottomRailPosition": 0,
+    "MiddleRailPosition": 100}` to a lowered shade with closed vanes, then
+    `MotorStop` about 3 s later, and record what `MiddleRailPosition` and
+    `TargetMiddleRailPosition` end up as and how long the hub takes to report
+    them. A lift stopped above 0 ends with the vanes closed and is reported
+    about 35 s later (4.6); whether a stopped tilt keeps a partial vane
+    position is unknown.
+13. **Keep collecting evidence.** The characterization log lives next to this
     file (`docs/hub-characterization-2026-10-22.log`). When you learn
     something new, run `tools/hubwatch.py` with its output appended to a new
     dated log in `docs/`, and cite the entry here.
