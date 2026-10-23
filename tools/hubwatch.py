@@ -9,7 +9,8 @@ long-poll in parallel so you can see whether events arrive.
 Examples::
 
     python3 tools/hubwatch.py --host 192.168.3.190 --names
-    python3 tools/hubwatch.py --host 192.168.3.190 --control 12177 MiddleRailPosition=50
+    python3 tools/hubwatch.py --host 192.168.3.190 --control 12177 BottomRailPosition=0 MiddleRailPosition=50
+    python3 tools/hubwatch.py --host 192.168.3.190 --control 12177 MotorStop=170
     python3 tools/hubwatch.py --host 192.168.3.190 --notify --duration 120
 
 Only the standard library is used so it runs anywhere Python 3.10+ does.
@@ -41,12 +42,19 @@ DEFAULT_FIELDS = (
 TOP_LEVEL_FIELDS = ("Error", "PairingMode", "OTA")
 NOTIFY_HOLD_SEC = 50.0
 
+# The loops read the clock and sleep through these aliases so tests can drive
+# time by patching them on the module instead of counting time.* calls.
+_monotonic = time.monotonic
+_sleep = time.sleep
+
 Snapshot = dict[int, dict[str, Any]]
 
 
 # ----- protocol helpers (pure; unit-tested) ----------------------------------
 
 
+# Copied from custom_components/shadeauto/api.py on purpose: this tool must not
+# import the integration, which pulls in aiohttp and homeassistant.
 def find_dicts_with_key(obj: Any, key: str) -> Iterator[dict[str, Any]]:
     """Yield every dict nested anywhere in ``obj`` that has ``key``."""
     if isinstance(obj, dict):
@@ -193,7 +201,7 @@ def _notify_loop(hub: Hub, stop: threading.Event) -> None:
             body = hub.notification(int(time.time()), NOTIFY_HOLD_SEC)
         except (urllib.error.URLError, OSError) as err:
             _print(f"{datetime.now():%H:%M:%S} NOTIFY error: {err}")
-            stop.wait(2)
+            _sleep(2)
             continue
         if body.strip():
             _print(f"{datetime.now():%H:%M:%S} NOTIFY {body.strip()[:800]}")
@@ -203,17 +211,17 @@ def _notify_loop(hub: Hub, stop: threading.Event) -> None:
 
 def watch(hub: Hub, args: argparse.Namespace, names: dict[int, str]) -> None:
     fields = tuple(args.fields.split(",")) if args.fields else DEFAULT_FIELDS
-    deadline = time.monotonic() + args.duration if args.duration else None
+    deadline = _monotonic() + args.duration if args.duration else None
     previous: Snapshot | None = None
     previous_top: dict[str, Any] | None = None
     last_change: float | None = None
 
-    while deadline is None or time.monotonic() < deadline:
+    while deadline is None or _monotonic() < deadline:
         try:
             status = hub.status()
         except (urllib.error.URLError, OSError, ValueError) as err:
             _print(f"{datetime.now():%H:%M:%S} status error: {err}")
-            time.sleep(args.interval)
+            _sleep(args.interval)
             continue
         now = datetime.now()
         if args.raw:
@@ -228,13 +236,13 @@ def watch(hub: Hub, args: argparse.Namespace, names: dict[int, str]) -> None:
             _print(f"{now:%H:%M:%S} hub " + "  ".join(f"{k}={v}" for k, v in top.items()))
         else:
             for uid, field, old, new in diff_snapshots(previous, current):
-                since = time.monotonic() - last_change if last_change is not None else None
+                since = _monotonic() - last_change if last_change is not None else None
                 _print(format_change(now, since, uid, names.get(uid), field, old, new))
-                last_change = time.monotonic()
+                last_change = _monotonic()
             if previous_top is not None and top != previous_top:
                 _print(f"{now:%H:%M:%S} hub {previous_top} -> {top}")
         previous, previous_top = current, top
-        time.sleep(args.interval)
+        _sleep(args.interval)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -252,7 +260,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--control",
         nargs="+",
         metavar=("UID", "KEY=VAL"),
-        help="send one /control command (e.g. 12177 MiddleRailPosition=50) before watching",
+        help="send one /control command (e.g. 12177 BottomRailPosition=0 MiddleRailPosition=50) before watching",
     )
     parser.add_argument("--no-watch", action="store_true", help="exit after --control instead of watching")
     return parser.parse_args(argv)

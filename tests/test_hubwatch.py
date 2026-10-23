@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime
+import threading
 from typing import Any
+import urllib.error
 
 import pytest
 
@@ -75,7 +77,17 @@ class _FakeHub(hubwatch.Hub):
         if path == "GetAllPeripheral":
             return load_json("get_all_peripheral")
         if path == "control":
-            return {"status": {"code": 0, "error": ""}}
+            # The real reply is flat: the UID, the command fields the hub stored
+            # as targets, Error, and the request's TaskID/Timestamp echoed back.
+            envelope = ("PeripheralUID", "ThingName", "TaskID", "Timestamp")
+            return {
+                "PeripheralUID": payload["PeripheralUID"],
+                **{key: value for key, value in payload.items() if key not in envelope},
+                "Error": 0,
+                "TaskID": payload["TaskID"],
+                "RequestTimestamp": payload["Timestamp"],
+                "Timestamp": payload["Timestamp"] * 1000,
+            }
         if path == "status":
             return load_json("status")
         raise AssertionError(path)
@@ -85,18 +97,21 @@ def test_main_sends_control_and_can_exit_without_watching(monkeypatch: pytest.Mo
     fake = _FakeHub()
     monkeypatch.setattr(hubwatch, "Hub", lambda host, port: fake)
 
-    rc = hubwatch.main(["--host", "h", "--names", "--control", str(KITCHEN), "MiddleRailPosition=50", "--no-watch"])
+    argv = ["--host", "h", "--names", "--control", str(KITCHEN), "BottomRailPosition=0", "MiddleRailPosition=50"]
+    rc = hubwatch.main([*argv, "--no-watch"])
 
     assert rc == 0
     paths = [path for path, _ in fake.posts]
     assert paths == ["registration", "GetAllPeripheral", "control"]
     control = fake.posts[-1][1]
     assert control["PeripheralUID"] == KITCHEN
+    assert control["BottomRailPosition"] == 0
     assert control["MiddleRailPosition"] == 50
     assert control["ThingName"] == load_json("registration")["ThingName"]
     out = capsys.readouterr().out
     assert "12177: Kitchen" in out
-    assert "control 12177 {'MiddleRailPosition': 50}" in out
+    assert "control 12177 {'BottomRailPosition': 0, 'MiddleRailPosition': 50} -> " in out
+    assert '"MiddleRailPosition": 50, "Error": 0' in out
 
 
 def test_main_watch_prints_initial_snapshot_then_changes(monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
@@ -105,18 +120,51 @@ def test_main_watch_prints_initial_snapshot_then_changes(monkeypatch: pytest.Mon
     for record in second["Peripherals"]:
         if record["PeripheralUID"] == KITCHEN:
             record["TargetMiddleRailPosition"] = 0
-    polls = iter([load_json("status"), second])
-    monkeypatch.setattr(fake, "status", lambda: next(polls))
+    polls = [load_json("status"), second]
+    monkeypatch.setattr(fake, "status", lambda: polls.pop(0))
     monkeypatch.setattr(hubwatch, "Hub", lambda host, port: fake)
-    monkeypatch.setattr(hubwatch.time, "sleep", lambda _s: None)
 
-    # monotonic() calls: deadline, loop check, loop check, last_change stamp, loop check (past deadline).
-    clock = iter([0.0, 0.0, 0.0, 0.5, 5.0])
-    monkeypatch.setattr(hubwatch.time, "monotonic", lambda: next(clock, 10.0))
+    # A fake clock that only moves when the loop sleeps, so a 1 s watch at a
+    # 0.5 s interval polls exactly twice however often the loop reads the clock.
+    now = 0.0
 
-    rc = hubwatch.main(["--host", "h", "--duration", "1", "--uid", str(KITCHEN)])
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    monkeypatch.setattr(hubwatch, "_monotonic", lambda: now)
+    monkeypatch.setattr(hubwatch, "_sleep", sleep)
+
+    rc = hubwatch.main(["--host", "h", "--duration", "1", "--interval", "0.5", "--uid", str(KITCHEN)])
 
     assert rc == 0
+    assert polls == []
     out = capsys.readouterr().out.splitlines()
     assert out[0].split()[1:3] == [str(KITCHEN), "BottomRailPosition=0"]
     assert any("TargetMiddleRailPosition 50 -> 0" in line for line in out)
+
+
+def test_notify_loop_prints_events_and_backs_off_after_errors(monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
+    fake = _FakeHub()
+    stop = threading.Event()
+    answers: list[Any] = [urllib.error.URLError("hub went away"), '{"Event": 1}', ""]
+
+    def notification(timestamp: int, hold_sec: float) -> str:
+        answer = answers.pop(0)
+        if not answers:
+            stop.set()
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(fake, "notification", notification)
+    slept: list[float] = []
+    monkeypatch.setattr(hubwatch, "_sleep", slept.append)
+
+    hubwatch._notify_loop(fake, stop)
+
+    assert slept == [2]
+    out = capsys.readouterr().out.splitlines()
+    assert out[0].endswith("NOTIFY error: <urlopen error hub went away>")
+    assert out[1].endswith('NOTIFY {"Event": 1}')
+    assert out[2].endswith("NOTIFY (hub returned without an event)")
